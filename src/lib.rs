@@ -10,7 +10,19 @@ use arcropolis_api::*;
 use walkdir::WalkDir;
 
 
+// HASH_TO_PATH -> used to load AnimBNTX in callback
+// FPS_TO_THREAD -> each fps has a thread associated with it that will play all files in that fps
+// HASHS_IN_FPS -> all hashes that belong to a certain fps
+// HASH_TO_ANIM_BNTX -> each loaded hash and it's respective AnimationBNTX
+// HASH_TO_CURRENT_FRAME -> each hash's current frame
+// HASH_TO_CURRENT_LOOP_COUNT -> each hash's current loop count
+
 static mut HASH_TO_PATH: Lazy<HashMap<u64, String>> = Lazy::new(|| HashMap::new());
+static mut FPS_TO_THREAD: Lazy<HashMap<u64, thread::JoinHandle<()>>> = Lazy::new(|| HashMap::new());
+static mut HASHS_IN_FPS: Lazy<HashMap<u64, Vec<u64>>> = Lazy::new(|| HashMap::new());
+static mut HASH_TO_ANIM_BNTX: Lazy<HashMap<u64, AnimationBNTX>> = Lazy::new(|| HashMap::new());
+static mut HASH_TO_CURRENT_FRAME: Lazy<HashMap<u64, u32>> = Lazy::new(|| HashMap::new());
+static mut HASH_TO_CURRENT_LOOP_COUNT: Lazy<HashMap<u64, i32>> = Lazy::new(|| HashMap::new());
 
 #[derive(BinRead)]
 #[br(magic = b"AnimBNTX")]
@@ -134,6 +146,7 @@ fn bntx_callback(hash: u64, bntx_data: &mut [u8]) -> Option<usize> {
                 let mut data = std::io::Cursor::new(data);
                 let animation_bntx_data = AnimationBNTX::read_le(&mut data).unwrap();
                 let bntx_callback_size = (animation_bntx_data.image_data_size as usize) + 0x1000 + animation_bntx_data.bntx_template_footer.len() as usize;
+                let fps_duration = (1000.0 / animation_bntx_data.frame_rate) as u64;
                 
                 let mut callback_data_vec: Vec<u8> = Vec::new();
     
@@ -141,53 +154,85 @@ fn bntx_callback(hash: u64, bntx_data: &mut [u8]) -> Option<usize> {
                 callback_data_vec.extend(animation_bntx_data.image_data_at_index(0));
                 callback_data_vec.extend(animation_bntx_data.bntx_template_footer.clone());
 
-                std::thread::spawn(move || {
-                    let mut current_frame = 0;
-                    let mut current_loop_count = 0;
-                    let sleep_duration = 1000.0 / animation_bntx_data.frame_rate;
-                    let loop_animation = animation_bntx_data.loop_animation == 1;
-                    loop {
-                        if !is_file_loaded(hash.clone()){
-                            break;
-                        }
+                if !HASHS_IN_FPS.contains_key(&fps_duration) {
+                    HASHS_IN_FPS.insert(fps_duration.clone(), Vec::new());
+                }
 
-                        if current_frame >= animation_bntx_data.ending_frame_loop {
-                            if loop_animation {
-                                if current_loop_count < animation_bntx_data.loop_count || animation_bntx_data.loop_count == -1 {
-                                    current_frame = animation_bntx_data.starting_frame_loop;
-                                    current_loop_count += 1;
+                HASHS_IN_FPS.get_mut(&fps_duration).unwrap().push(hash);
+                HASH_TO_ANIM_BNTX.insert(hash.clone(), animation_bntx_data);
+                HASH_TO_CURRENT_FRAME.insert(hash.clone(), 0);
+                HASH_TO_CURRENT_LOOP_COUNT.insert(hash.clone(), 0);
+
+                if !FPS_TO_THREAD.contains_key(&fps_duration) {
+                    let thread_data = std::thread::spawn(move || {
+                        loop {
+                            let hashes = HASHS_IN_FPS.get(&fps_duration).unwrap();
+
+                            if hashes.len() == 0 {
+                                // Remove thread from fps_to_thread
+                                FPS_TO_THREAD.remove(&fps_duration);
+                                break;
+                            }
+
+                            for hash in hashes {
+                                let mut current_frame = HASH_TO_CURRENT_FRAME.get_mut(&hash).unwrap();
+                                let mut current_loop_count = HASH_TO_CURRENT_LOOP_COUNT.get_mut(&hash).unwrap();
+                                let anim_bntx = HASH_TO_ANIM_BNTX.get(&hash).unwrap();
+                                let loop_animation = anim_bntx.loop_animation == 1;
+                                if !is_file_loaded(hash.clone()){
+                                    // Remove from respective hashes
+                                    HASH_TO_ANIM_BNTX.remove(&hash);
+                                    HASH_TO_CURRENT_FRAME.remove(&hash);
+                                    HASH_TO_CURRENT_LOOP_COUNT.remove(&hash);
+                                    
+                                    let index = hashes.iter().position(|x| *x == *hash).unwrap();
+                                    HASHS_IN_FPS.get_mut(&fps_duration).unwrap().remove(index);
+                                    
+                                    continue;
                                 }
+
+                                if *current_frame >= anim_bntx.ending_frame_loop {
+                                    if loop_animation {
+                                        if *current_loop_count < anim_bntx.loop_count || anim_bntx.loop_count == -1 {
+                                            *current_frame = anim_bntx.starting_frame_loop;
+                                            *current_loop_count += 1;
+                                        }
+                                    }
+                                }
+
+                                if *current_frame >= anim_bntx.frame_count {
+                                    if !loop_animation {
+                                        *current_frame = anim_bntx.ending_frame_loop;
+                                    } else {
+                                        *current_frame = anim_bntx.starting_frame_loop;
+                                    }
+                                }
+                                let frame_data = &anim_bntx.frame_datas[*current_frame as usize];
+        
+                                let image_slice = anim_bntx.image_data_at_index(frame_data.image_index as usize);
+        
+                                let mut data_vec: Vec<u8> = Vec::new();
+                                data_vec.extend(anim_bntx.bntx_template_header.clone());
+                                data_vec.extend(image_slice);
+                                data_vec.extend(anim_bntx.bntx_template_footer.clone());
+                                let data_slice = data_vec.as_slice();
+        
+                                auto_refresh_bntx(
+                                    hash.clone(),
+                                    data_slice.as_ptr() as *mut u8,
+                                    data_slice.len(),
+                                );
+        
+                                *current_frame += 1;
                             }
+                            thread::sleep(Duration::from_millis(fps_duration as u64));
                         }
-                        
-                        if current_frame >= animation_bntx_data.frame_count {
-                            if !loop_animation {
-                                current_frame = animation_bntx_data.ending_frame_loop;
-                            } else {
-                                current_frame = animation_bntx_data.starting_frame_loop;
-                            }
-                        }
+                    });
 
-                        let frame_data = &animation_bntx_data.frame_datas[current_frame as usize];
+                    FPS_TO_THREAD.insert(fps_duration, thread_data);
+                }
 
-                        let image_slice = animation_bntx_data.image_data_at_index(frame_data.image_index as usize);
 
-                        let mut data_vec: Vec<u8> = Vec::new();
-                        data_vec.extend(animation_bntx_data.bntx_template_header.clone());
-                        data_vec.extend(image_slice);
-                        data_vec.extend(animation_bntx_data.bntx_template_footer.clone());
-                        let data_slice = data_vec.as_slice();
-
-                        auto_refresh_bntx(
-                            hash.clone(),
-                            data_slice.as_ptr() as *mut u8,
-                            data_slice.len(),
-                        );
-
-                        current_frame += 1;
-                        thread::sleep(Duration::from_millis(sleep_duration as u64));
-                    }
-                });
 
                 bntx_data[..callback_data_vec.len()].copy_from_slice(&callback_data_vec.as_slice());
                 return Some(callback_data_vec.len());
