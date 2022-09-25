@@ -16,6 +16,8 @@ use walkdir::WalkDir;
 // HASH_TO_ANIM_BNTX -> each loaded hash and it's respective AnimationBNTX
 // HASH_TO_CURRENT_FRAME -> each hash's current frame
 // HASH_TO_CURRENT_LOOP_COUNT -> each hash's current loop count
+// GROUP_TO_CURRENT_FRAME -> each (animationbntx group num << 16) + (fps_duration << 16) + loop_animation current frame (used to keep multiple animations on the same frames)
+
 
 static mut HASH_TO_PATH: Lazy<HashMap<u64, String>> = Lazy::new(|| HashMap::new());
 static mut FPS_TO_THREAD: Lazy<HashMap<u64, thread::JoinHandle<()>>> = Lazy::new(|| HashMap::new());
@@ -23,10 +25,17 @@ static mut HASHS_IN_FPS: Lazy<HashMap<u64, Vec<u64>>> = Lazy::new(|| HashMap::ne
 static mut HASH_TO_ANIM_BNTX: Lazy<HashMap<u64, AnimationBNTX>> = Lazy::new(|| HashMap::new());
 static mut HASH_TO_CURRENT_FRAME: Lazy<HashMap<u64, u32>> = Lazy::new(|| HashMap::new());
 static mut HASH_TO_CURRENT_LOOP_COUNT: Lazy<HashMap<u64, i32>> = Lazy::new(|| HashMap::new());
+static mut GROUP_TO_CURRENT_FRAME: Lazy<HashMap<u64, u32>> = Lazy::new(|| HashMap::new());
+static mut GROUP_TO_CURRENT_LOOP_COUNT: Lazy<HashMap<u64, i32>> = Lazy::new(|| HashMap::new());
+static mut GROUPS_IN_FPS: Lazy<HashMap<u64, Vec<u64>>> = Lazy::new(|| HashMap::new());
+static mut GROUP_LOOP_ANIMATION: Lazy<HashMap<u64, bool>> = Lazy::new(|| HashMap::new());
 
 #[derive(BinRead)]
 #[br(magic = b"AnimBNTX")]
 struct AnimationBNTX {
+    version_major: u32,
+    version_minor: u32,
+    group_number: u32,
     frame_count: u32,
     loop_animation: u32,
     loop_count: i32,
@@ -147,6 +156,8 @@ fn bntx_callback(hash: u64, bntx_data: &mut [u8]) -> Option<usize> {
                 let animation_bntx_data = AnimationBNTX::read_le(&mut data).unwrap();
                 let bntx_callback_size = (animation_bntx_data.image_data_size as usize) + 0x1000 + animation_bntx_data.bntx_template_footer.len() as usize;
                 let fps_duration = (1000.0 / animation_bntx_data.frame_rate) as u64;
+                let loop_anim = animation_bntx_data.loop_animation;
+                let group_id = (animation_bntx_data.group_number << 16) as u64 + (fps_duration << 16) + loop_anim as u64;
                 
                 let mut callback_data_vec: Vec<u8> = Vec::new();
     
@@ -162,6 +173,19 @@ fn bntx_callback(hash: u64, bntx_data: &mut [u8]) -> Option<usize> {
                 HASH_TO_ANIM_BNTX.insert(hash.clone(), animation_bntx_data);
                 HASH_TO_CURRENT_FRAME.insert(hash.clone(), 0);
                 HASH_TO_CURRENT_LOOP_COUNT.insert(hash.clone(), 0);
+                
+                if !GROUPS_IN_FPS.contains_key(&fps_duration) {
+                    GROUPS_IN_FPS.insert(fps_duration.clone(), Vec::new());
+                }
+
+                GROUPS_IN_FPS.get_mut(&fps_duration).unwrap().push(group_id.clone());
+                GROUP_TO_CURRENT_FRAME.insert(group_id.clone(), 0);
+                GROUP_TO_CURRENT_LOOP_COUNT.insert(group_id.clone(), 0);
+
+
+                if !GROUP_LOOP_ANIMATION.contains_key(&group_id) {
+                    GROUP_LOOP_ANIMATION.insert(group_id.clone(), loop_anim == 1);
+                }
 
                 if !FPS_TO_THREAD.contains_key(&fps_duration) {
                     let thread_data = std::thread::spawn(move || {
@@ -169,16 +193,44 @@ fn bntx_callback(hash: u64, bntx_data: &mut [u8]) -> Option<usize> {
                             let hashes = HASHS_IN_FPS.get(&fps_duration).unwrap();
 
                             if hashes.len() == 0 {
-                                // Remove thread from fps_to_thread
+                                // Remove thread from fps_to_thread and associated groups
                                 FPS_TO_THREAD.remove(&fps_duration);
+                                for group in GROUPS_IN_FPS.get(&fps_duration).unwrap() {
+                                    GROUP_TO_CURRENT_FRAME.remove(&group);
+                                    GROUP_TO_CURRENT_LOOP_COUNT.remove(&group);
+                                    GROUP_LOOP_ANIMATION.remove(&group);
+                                }
+                                GROUPS_IN_FPS.remove(&fps_duration);
                                 break;
                             }
 
                             for hash in hashes {
-                                let mut current_frame = HASH_TO_CURRENT_FRAME.get_mut(&hash).unwrap();
-                                let mut current_loop_count = HASH_TO_CURRENT_LOOP_COUNT.get_mut(&hash).unwrap();
                                 let anim_bntx = HASH_TO_ANIM_BNTX.get(&hash).unwrap();
-                                let loop_animation = anim_bntx.loop_animation == 1;
+
+                                let mut current_frame = {
+                                    if anim_bntx.group_number == 0 {
+                                        HASH_TO_CURRENT_FRAME.get_mut(&hash).unwrap()
+                                    } else {
+                                        GROUP_TO_CURRENT_FRAME.get_mut(&group_id).unwrap()
+                                    }
+                                };
+
+                                let mut current_loop_count = {
+                                    if anim_bntx.group_number == 0 {
+                                        HASH_TO_CURRENT_LOOP_COUNT.get_mut(&hash).unwrap()
+                                    } else {
+                                        GROUP_TO_CURRENT_LOOP_COUNT.get_mut(&group_id).unwrap()
+                                    }
+                                };
+
+                                let loop_animation = {
+                                    if anim_bntx.group_number == 0 {
+                                        anim_bntx.loop_animation == 1
+                                    } else {
+                                        *GROUP_LOOP_ANIMATION.get(&group_id).unwrap()
+                                    }
+                                };
+
                                 if !is_file_loaded(hash.clone()){
                                     // Remove from respective hashes
                                     HASH_TO_ANIM_BNTX.remove(&hash);
@@ -207,8 +259,8 @@ fn bntx_callback(hash: u64, bntx_data: &mut [u8]) -> Option<usize> {
                                         *current_frame = anim_bntx.starting_frame_loop;
                                     }
                                 }
+
                                 let frame_data = &anim_bntx.frame_datas[*current_frame as usize];
-        
                                 let image_slice = anim_bntx.image_data_at_index(frame_data.image_index as usize);
         
                                 let mut data_vec: Vec<u8> = Vec::new();
@@ -223,8 +275,15 @@ fn bntx_callback(hash: u64, bntx_data: &mut [u8]) -> Option<usize> {
                                     data_slice.len(),
                                 );
         
-                                *current_frame += 1;
+                                if anim_bntx.group_number != 0 {
+                                    *current_frame += 1;
+                                }
                             }
+
+                            for group in GROUPS_IN_FPS.get(&fps_duration).unwrap() {
+                                *GROUP_TO_CURRENT_FRAME.get_mut(&group).unwrap() += 1;
+                            }
+
                             thread::sleep(Duration::from_millis(fps_duration as u64));
                         }
                     });
