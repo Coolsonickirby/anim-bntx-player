@@ -16,6 +16,7 @@ binrw = "0.10.0"
 once_cell = "1.12.0"
 arcropolis-api = { git = "https://github.com/Raytwo/arcropolis_api" }
 walkdir = "2.3.2"
+ruzstd = "0.3.0"
 
 [profile.dev]
 panic = "abort"

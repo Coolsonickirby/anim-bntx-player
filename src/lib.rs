@@ -8,7 +8,8 @@ use std::time::Duration;
 use std::path::*;
 use arcropolis_api::*;
 use walkdir::WalkDir;
-
+use ruzstd::streaming_decoder::StreamingDecoder;
+use std::io::{self, Error, ErrorKind, Read, Result, Write};
 
 // HASH_TO_PATH -> used to load AnimBNTX in callback
 // FPS_TO_THREAD -> each fps has a thread associated with it that will play all files in that fps
@@ -44,8 +45,11 @@ struct AnimationBNTX {
     relocation_table_size: u32,
     image_data_count: u32,
     image_data_size: u32,
+    #[br(count = image_data_count)]
+    image_datas: Vec<ImageData>,
+    
     frame_rate: f32,
-
+    
     #[br(count = frame_count)]
     frame_datas: Vec<FrameData>,
 
@@ -55,13 +59,25 @@ struct AnimationBNTX {
     #[br(count = relocation_table_size)]
     bntx_template_footer: Vec<u8>,
     
-    #[br(count = image_data_count * image_data_size)]
-    image_datas: Vec<u8>
+    #[br(parse_with = binrw::until_eof)]
+    compressed_datas: Vec<u8>
+}
+
+pub fn decode_all<R: Read>(mut source: R) -> Result<Vec<u8>> {
+    let mut decoder =
+        StreamingDecoder::new(&mut source).map_err(|err| Error::new(ErrorKind::Other, err))?;
+
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out)?;
+
+    Ok(out)
 }
 
 impl AnimationBNTX {
-    pub fn image_data_at_index(&self, index: usize) -> &[u8] {
-        &self.image_datas[index * self.image_data_size as usize..(index + 1) * self.image_data_size as usize]
+    pub fn image_data_at_index(&self, index: usize) -> Vec<u8> {
+        let compressed_image_data = &self.compressed_datas[self.image_datas[index].offset as usize..self.image_datas[index].offset as usize + (self.image_datas[index].size) as usize];
+        let res = decode_all(compressed_image_data).unwrap();
+        res
     }
 }
 
@@ -69,6 +85,12 @@ impl AnimationBNTX {
 struct FrameData {
     keyframe_num: u32,
     image_index: u32
+}
+
+#[derive(BinRead, Debug)]
+struct ImageData {
+    offset: u32,
+    size: u32
 }
 
 const SCAN_DIR: &str = "sd:/ultimate/mods";
@@ -146,9 +168,7 @@ unsafe fn setup_animbntx_callback(hash: &u64){
 
 #[arc_callback]
 fn bntx_callback(hash: u64, bntx_data: &mut [u8]) -> Option<usize> {
-    unsafe {
-        println!("Callback ran for {:#x}", hash);
-        
+    unsafe {        
         let file_path = HASH_TO_PATH.get(&hash).unwrap();
         match std::fs::read(&file_path){
             Ok(data) => {
@@ -178,7 +198,10 @@ fn bntx_callback(hash: u64, bntx_data: &mut [u8]) -> Option<usize> {
                     GROUPS_IN_FPS.insert(fps_duration.clone(), Vec::new());
                 }
 
-                GROUPS_IN_FPS.get_mut(&fps_duration).unwrap().push(group_id.clone());
+                if !GROUPS_IN_FPS.get(&fps_duration).unwrap().contains(&group_id) {
+                    GROUPS_IN_FPS.get_mut(&fps_duration).unwrap().push(group_id.clone());
+                }
+
                 GROUP_TO_CURRENT_FRAME.insert(group_id.clone(), 0);
                 GROUP_TO_CURRENT_LOOP_COUNT.insert(group_id.clone(), 0);
 
@@ -253,11 +276,7 @@ fn bntx_callback(hash: u64, bntx_data: &mut [u8]) -> Option<usize> {
                                 }
 
                                 if *current_frame >= anim_bntx.frame_count {
-                                    if !loop_animation {
-                                        *current_frame = anim_bntx.ending_frame_loop;
-                                    } else {
-                                        *current_frame = anim_bntx.starting_frame_loop;
-                                    }
+                                    *current_frame = anim_bntx.ending_frame_loop;
                                 }
 
                                 let frame_data = &anim_bntx.frame_datas[*current_frame as usize];
@@ -267,6 +286,7 @@ fn bntx_callback(hash: u64, bntx_data: &mut [u8]) -> Option<usize> {
                                 data_vec.extend(anim_bntx.bntx_template_header.clone());
                                 data_vec.extend(image_slice);
                                 data_vec.extend(anim_bntx.bntx_template_footer.clone());
+
                                 let data_slice = data_vec.as_slice();
         
                                 auto_refresh_bntx(
@@ -275,7 +295,7 @@ fn bntx_callback(hash: u64, bntx_data: &mut [u8]) -> Option<usize> {
                                     data_slice.len(),
                                 );
         
-                                if anim_bntx.group_number != 0 {
+                                if anim_bntx.group_number == 0 {
                                     *current_frame += 1;
                                 }
                             }
